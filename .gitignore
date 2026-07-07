@@ -9,6 +9,7 @@ venv/
 .vscode/
 .agents/
 .codex/
+.doc_work/
 node_modules/
 dist/
 frontend/dist/
