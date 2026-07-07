@@ -1,0 +1,145 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: literature_agent_mysql
+    environment:
+      MYSQL_DATABASE: literature_agent
+      MYSQL_USER: agent
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p\"$${MYSQL_ROOT_PASSWORD}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    container_name: literature_agent_backend
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY in .env}
+      DJANGO_DEBUG: "1"
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,backend
+      DB_ENGINE: mysql
+      MYSQL_DATABASE: literature_agent
+      MYSQL_USER: agent
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      MYSQL_HOST: db
+      MYSQL_PORT: 3306
+      USE_LLM: ${USE_LLM:-0}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}
+      LLM_REQUEST_TIMEOUT: ${LLM_REQUEST_TIMEOUT:-60}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-2200}
+      LLM_KEYWORD_MAX_TOKENS: ${LLM_KEYWORD_MAX_TOKENS:-260}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_PROVIDER_NAME: ${LLM_PROVIDER_NAME:-GPT}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      RAG_TOP_K: ${RAG_TOP_K:-8}
+      RAG_VECTOR_TOP_K: ${RAG_VECTOR_TOP_K:-8}
+      RAG_EMBEDDING_BASE_URL: ${RAG_EMBEDDING_BASE_URL:-http://host.docker.internal:11434/v1}
+      RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-embeddinggemma}
+      RAG_EMBEDDING_API_KEY: ${RAG_EMBEDDING_API_KEY:-ollama}
+      RAG_EMBEDDING_TIMEOUT: ${RAG_EMBEDDING_TIMEOUT:-30}
+      RAG_RERANK_ENABLED: ${RAG_RERANK_ENABLED:-0}
+      RAG_RERANK_MODEL_PATH: ${RAG_RERANK_MODEL_PATH:-}
+      RAG_RERANK_LOCAL_ONLY: ${RAG_RERANK_LOCAL_ONLY:-1}
+      RAG_RERANK_MAX_LENGTH: ${RAG_RERANK_MAX_LENGTH:-512}
+      USE_MILVUS: ${USE_MILVUS:-1}
+      MILVUS_HOST: ${MILVUS_HOST:-milvus}
+      MILVUS_PORT: ${MILVUS_PORT:-19530}
+      MILVUS_COLLECTION: ${MILVUS_COLLECTION:-literature_rag_chunks}
+      MILVUS_VECTOR_DIM: ${MILVUS_VECTOR_DIM:-768}
+      MILVUS_METRIC_TYPE: ${MILVUS_METRIC_TYPE:-IP}
+      MILVUS_INDEX_TYPE: ${MILVUS_INDEX_TYPE:-FLAT}
+      MILVUS_USER: ${MILVUS_USER:-}
+      MILVUS_PASSWORD: ${MILVUS_PASSWORD:-}
+      MILVUS_SECURE: ${MILVUS_SECURE:-0}
+      NCBI_TOOL: literature_agent_demo
+      NCBI_EMAIL: ${NCBI_EMAIL:-}
+      NCBI_API_KEY: ${NCBI_API_KEY:-}
+      CROSSREF_MAILTO: ${CROSSREF_MAILTO:-}
+      EXTERNAL_REQUEST_TIMEOUT: "15"
+      HTTP_USER_AGENT: literature-agent-demo/1.0
+      SSL_CERT_FILE: ""
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "python manage.py migrate &&
+             python manage.py seed_demo &&
+             python manage.py runserver 0.0.0.0:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: http://127.0.0.1:8000/api
+    container_name: literature_agent_frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    container_name: literature_agent_etcd
+    profiles: ["milvus"]
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: >
+      etcd -advertise-client-urls=http://127.0.0.1:2379
+      -listen-client-urls http://0.0.0.0:2379
+      --data-dir /etcd
+    volumes:
+      - etcd_data:/etcd
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: literature_agent_minio
+    profiles: ["milvus"]
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data
+    ports:
+      - "9001:9000"
+    volumes:
+      - minio_data:/minio_data
+
+  milvus:
+    image: milvusdb/milvus:v2.4.15
+    container_name: literature_agent_milvus
+    profiles: ["milvus"]
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      - etcd
+      - minio
+
+volumes:
+  mysql_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
