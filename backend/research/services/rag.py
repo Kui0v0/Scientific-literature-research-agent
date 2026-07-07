@@ -27,7 +27,12 @@ def retrieve_evidence(query, records, limit=None):
     if not documents:
         return []
 
-    return _finalize_evidence(_milvus_retrieve(query, documents, limit), limit)
+    evidence = _finalize_evidence(_milvus_retrieve(query, documents, limit), limit)
+    if evidence:
+        return evidence
+    if os.getenv("RAG_RECORD_CONTEXT_FALLBACK", "1") != "1":
+        return []
+    return _record_context_evidence(documents, limit)
 
 
 def format_evidence_pack(documents, max_abstract_chars=None):
@@ -57,6 +62,12 @@ def evidence_reference_note(documents):
     return "；".join(
         f"[{doc['ref']}] {doc['title']}（{doc.get('source') or 'Unknown'}）" for doc in documents
     )
+
+
+def evidence_generation_label(documents):
+    if documents and all(doc.get("retrieval_fallback") for doc in documents):
+        return "真实文献上下文约束（Milvus/embedding 暂未返回向量证据）"
+    return "Milvus RAG 证据约束"
 
 
 def _milvus_retrieve(query, documents, limit):
@@ -397,8 +408,18 @@ def _finalize_evidence(documents, limit):
     return output
 
 
+def _record_context_evidence(documents, limit):
+    output = []
+    for doc in documents[:limit]:
+        item = dict(doc)
+        item["retrieval"] = "文献上下文（Milvus 或 embedding 暂未返回向量证据）"
+        item["retrieval_fallback"] = True
+        output.append(item)
+    return _finalize_evidence(output, limit)
+
+
 def _retrieval_line(doc):
-    parts = [f"召回：{doc.get('retrieval') or 'Milvus vector'}"]
+    parts = [f"召回：{doc.get('retrieval') or '文献上下文'}"]
     if doc.get("vector_score") is not None:
         parts.append(f"向量得分：{float(doc.get('vector_score')):.4f}")
     if doc.get("rerank_score") is not None:

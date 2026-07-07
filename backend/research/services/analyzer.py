@@ -1,4 +1,5 @@
 from collections import Counter
+import json
 import re
 
 from .llm import LLMError, chat_json, llm_enabled, set_llm_status
@@ -130,13 +131,15 @@ def _topic_counters(records, max_year):
 
 def _topic_terms_for_records(records):
     if llm_enabled():
-        terms_by_record = []
-        llm_record_count = 0
-        for record in records:
-            terms = _extract_llm_topic_terms(record)
-            if terms:
-                llm_record_count += 1
-            terms_by_record.append(terms)
+        terms_by_record = _extract_llm_topic_terms_batch(records)
+        llm_record_count = sum(1 for terms in terms_by_record if terms)
+        if not llm_record_count:
+            terms_by_record = []
+            for record in records:
+                terms = _extract_llm_topic_terms(record)
+                if terms:
+                    llm_record_count += 1
+                terms_by_record.append(terms)
         if llm_record_count:
             return terms_by_record, "llm"
 
@@ -147,6 +150,52 @@ def _topic_terms_for_records(records):
             terms = terms[:5]
         terms_by_record.append(terms)
     return terms_by_record, "metadata"
+
+
+def _extract_llm_topic_terms_batch(records):
+    items = []
+    for index, record in enumerate(records or [], start=1):
+        title = str(record.get("title") or "").strip()
+        abstract = str(record.get("abstract") or "").strip()
+        if not title and not abstract:
+            continue
+        items.append(
+            {
+                "index": index,
+                "title": title[:260],
+                "abstract": abstract[:1000],
+            }
+        )
+    if not items:
+        return [[] for _ in records]
+    try:
+        payload = chat_json(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是科研文献主题词批量抽取助手。你会收到多篇文献的标题和摘要。"
+                        "必须分别为每篇文献提取 3-5 个主题词。不要输出数据库分类号或元数据标签，"
+                        "例如 cs.CL、cs.LG、q-bio、Biological science。不要输出 research、study、method、analysis 这类过泛词。"
+                        "输出必须是合法 JSON。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"文献列表 JSON：{json.dumps(items, ensure_ascii=False)}\n\n"
+                        "请只输出 JSON，不要 Markdown："
+                        "{\"items\": [{\"index\": 1, \"keywords\": [\"主题词1\", \"主题词2\"]}]}"
+                    ),
+                },
+            ],
+            temperature=0,
+            max_tokens=env_int("LLM_KEYWORD_BATCH_MAX_TOKENS", 1200, minimum=500, maximum=3000),
+        )
+        by_index = _coerce_batch_topic_terms(payload)
+        return [_clean_topic_terms(by_index.get(index, []))[:5] for index in range(1, len(records or []) + 1)]
+    except (LLMError, Exception):
+        return [[] for _ in records]
 
 
 def _extract_llm_topic_terms(record):
@@ -183,6 +232,40 @@ def _extract_llm_topic_terms(record):
         return _clean_topic_terms(_coerce_topic_terms(payload))[:5]
     except (LLMError, Exception):
         return []
+
+
+def _coerce_batch_topic_terms(payload):
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = None
+        for key in ["items", "documents", "records", "results", "文献", "结果"]:
+            value = payload.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+        if items is None:
+            items = []
+            for key, value in payload.items():
+                if str(key).isdigit():
+                    items.append({"index": key, "keywords": value})
+    else:
+        items = []
+
+    output = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(_first_present(item, "index", "id", "序号", "编号") or 0)
+        except (TypeError, ValueError):
+            index = 0
+        if not index:
+            continue
+        terms = _coerce_topic_terms(item)
+        if terms:
+            output[index] = terms
+    return output
 
 
 def _coerce_topic_terms(payload):

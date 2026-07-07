@@ -1,5 +1,5 @@
 from .llm import LLMError, chat_completion, fallback_notice, generation_notice, llm_enabled, strip_generation_metadata
-from .rag import env_int, format_evidence_pack, retrieve_evidence
+from .rag import env_int, evidence_generation_label, format_evidence_pack, retrieve_evidence
 
 
 SECTION_TITLES = {
@@ -117,7 +117,7 @@ def _try_llm_draft(section, title, query, review_text, experiment_plan, notes, r
             max_tokens=env_int("LLM_WRITING_MAX_TOKENS", 950, minimum=500, maximum=2200),
         )
         content = strip_generation_metadata(content)
-        return generation_notice(len(evidence)) + content if content else ""
+        return generation_notice(len(evidence), evidence_generation_label(evidence)) + content if content else ""
     except (LLMError, Exception):
         return ""
 

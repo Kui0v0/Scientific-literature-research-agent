@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -36,10 +37,10 @@ def llm_config_status():
     }
 
 
-def generation_notice(evidence_count=0):
+def generation_notice(evidence_count=0, evidence_label="Milvus RAG 证据约束"):
     provider = _provider_label()
     model = _model_name()
-    return f"> 生成方式：{provider} + Milvus RAG 证据约束；模型：{model}；证据文献：{evidence_count} 条。\n\n"
+    return f"> 生成方式：{provider} + {evidence_label}；模型：{model}；证据文献：{evidence_count} 条。\n\n"
 
 
 def fallback_notice(reason=None):
@@ -133,17 +134,27 @@ def chat_completion(messages, temperature=0.2, max_tokens=None, response_format=
         },
         method="POST",
     )
-    try:
-        timeout = int(os.getenv("LLM_REQUEST_TIMEOUT", "60"))
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            result = json.loads(response.read().decode("utf-8", errors="ignore"))
-    except urllib.error.HTTPError as exc:
-        detail = _sanitize_error_detail(exc.read().decode("utf-8", errors="ignore"))
-        _LAST_LLM_STATUS = f"{_provider_label()} API 返回 HTTP {exc.code}：{detail}"
-        raise LLMError(f"LLM HTTP {exc.code}: {detail}") from exc
-    except Exception as exc:
-        _LAST_LLM_STATUS = f"{_provider_label()} 请求失败：{_sanitize_error_detail(str(exc))}"
-        raise LLMError(_LAST_LLM_STATUS) from exc
+    timeout = int(os.getenv("LLM_REQUEST_TIMEOUT", "90"))
+    retry_count = max(0, int(os.getenv("LLM_RETRY_COUNT", "2")))
+    retry_delay = max(0.2, float(os.getenv("LLM_RETRY_DELAY", "1.2")))
+    result = None
+    for attempt in range(retry_count + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                result = json.loads(response.read().decode("utf-8", errors="ignore"))
+            break
+        except urllib.error.HTTPError as exc:
+            detail = _sanitize_error_detail(exc.read().decode("utf-8", errors="ignore"))
+            _LAST_LLM_STATUS = f"{_provider_label()} API 返回 HTTP {exc.code}：{detail}"
+            if exc.code not in {408, 409, 425, 429, 500, 502, 503, 504} or attempt >= retry_count:
+                raise LLMError(f"LLM HTTP {exc.code}: {detail}") from exc
+        except Exception as exc:
+            _LAST_LLM_STATUS = f"{_provider_label()} 请求失败：{_sanitize_error_detail(str(exc))}"
+            if attempt >= retry_count:
+                raise LLMError(_LAST_LLM_STATUS) from exc
+        time.sleep(retry_delay * (attempt + 1))
+    if result is None:
+        raise LLMError(_LAST_LLM_STATUS or "大模型请求失败。")
 
     choices = result.get("choices") or []
     if not choices:

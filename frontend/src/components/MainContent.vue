@@ -660,13 +660,16 @@ function draftPanelName(draft, index = 0) {
 function generationMode(item) {
   const text = [item?.content, item?.content_md, item?.review_text, item?.rationale, item?.summary].filter(Boolean).join(' ')
   if (/规则模板兜底/.test(text)) return 'rules'
+  if (/真实文献上下文约束/.test(text)) return 'llm_context'
   if (/\[R\d+\]|(DeepSeek|OpenAI|GPT|大模型)\s*\+\s*(?:Milvus\s+)?RAG/.test(text)) return 'llm_rag'
   const explicit = item?.generation_mode || item?.generation || item?.payload?.generation
   return explicit || 'rules'
 }
 
 function generationLabel(item) {
-  if (generationMode(item) !== 'llm_rag') return '规则兜底'
+  const mode = generationMode(item)
+  if (mode === 'llm_context') return 'GPT + 文献上下文'
+  if (mode !== 'llm_rag') return '规则兜底'
   const text = [item?.content, item?.content_md, item?.review_text, item?.rationale, item?.summary].filter(Boolean).join(' ')
   if (/DeepSeek\s*\+\s*(?:Milvus\s+)?RAG/i.test(text)) return 'DeepSeek + RAG'
   if (/OpenAI\s*\+\s*(?:Milvus\s+)?RAG/i.test(text)) return 'OpenAI + RAG'
@@ -674,7 +677,7 @@ function generationLabel(item) {
 }
 
 function generationType(item) {
-  return generationMode(item) === 'llm_rag' ? 'success' : 'warning'
+  return ['llm_rag', 'llm_context'].includes(generationMode(item)) ? 'success' : 'warning'
 }
 
 function keywordGenerationMode(item) {
@@ -699,8 +702,9 @@ function keywordGenerationType(item) {
 }
 
 function generationDescription(item) {
-  return generationMode(item) === 'llm_rag'
-    ? '已基于真实检索文献证据包生成，正文中的 [R1] 等编号对应检索结果。'
-    : '当前为规则模板兜底，通常是未配置大模型、请求超时或返回内容未通过校验。'
+  const mode = generationMode(item)
+  if (mode === 'llm_rag') return '已基于 Milvus 向量召回证据包生成，正文中的 [R1] 等编号对应检索结果。'
+  if (mode === 'llm_context') return 'Milvus/embedding 暂未返回向量证据，但已基于真实检索文献上下文调用大模型生成。'
+  return '当前为规则模板兜底，通常是未配置大模型、请求超时或返回内容未通过校验。'
 }
 </script>

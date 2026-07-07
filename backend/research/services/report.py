@@ -1,5 +1,5 @@
 from .llm import LLMError, chat_completion, fallback_notice, generation_notice, llm_enabled, strip_generation_metadata
-from .rag import env_int, format_evidence_pack, retrieve_evidence
+from .rag import env_int, evidence_generation_label, format_evidence_pack, retrieve_evidence
 
 
 def build_report(task, records, analysis=None, experiment=None, drafts=None):
@@ -108,7 +108,7 @@ def _try_llm_report(task, records, analysis_payload, experiment_payload, drafts)
             max_tokens=env_int("LLM_REPORT_MAX_TOKENS", 1500, minimum=800, maximum=3200),
         )
         content = strip_generation_metadata(content)
-        return generation_notice(len(evidence)) + content if content else ""
+        return generation_notice(len(evidence), evidence_generation_label(evidence)) + content if content else ""
     except (LLMError, Exception):
         return ""
 

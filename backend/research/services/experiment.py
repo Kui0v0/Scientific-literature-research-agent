@@ -1,5 +1,5 @@
 from .llm import LLMError, chat_json, fallback_notice, generation_notice, llm_enabled, set_llm_status
-from .rag import env_int, format_evidence_pack, retrieve_evidence
+from .rag import env_int, evidence_generation_label, format_evidence_pack, retrieve_evidence
 
 
 def build_experiment_plan(question, analysis_payload=None, records=None):
@@ -143,7 +143,7 @@ def _try_llm_experiment_plan(question, analysis_payload, records):
             route,
             expected_results,
             risks,
-            notice=generation_notice(len(evidence)),
+            notice=generation_notice(len(evidence), evidence_generation_label(evidence)),
         )
         return {
             "question": question,

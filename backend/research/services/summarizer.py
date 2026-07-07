@@ -1,7 +1,7 @@
 from collections import Counter
 
 from .llm import LLMError, chat_completion, fallback_notice, generation_notice, llm_enabled, set_llm_status
-from .rag import env_int, format_evidence_pack, retrieve_evidence
+from .rag import env_int, evidence_generation_label, format_evidence_pack, retrieve_evidence
 
 
 def generate_review(query, records):
@@ -46,7 +46,7 @@ def _try_llm_review(query, records):
             )
             if continuation:
                 content = f"{content.rstrip()}\n\n{continuation.lstrip()}"
-        return generation_notice(len(evidence)) + content if content else ""
+        return generation_notice(len(evidence), evidence_generation_label(evidence)) + content if content else ""
     except (LLMError, Exception):
         return ""
 
