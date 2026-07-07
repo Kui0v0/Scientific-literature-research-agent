@@ -61,6 +61,7 @@
         :roles="roles"
         :log-rows="logRows"
         :settings="settings"
+        :full-agent-status="fullAgentStatus"
         :run-full-agent="runFullAgent"
         :run-search="runSearch"
         :open-notification-drawer="openNotificationDrawer"
@@ -221,6 +222,7 @@ const legacyKeywordRefreshTaskId = ref(null)
 const experiment = ref(null)
 const drafts = ref([])
 const report = ref(null)
+const fullAgentStatus = ref('')
 const systemLogRows = ref([])
 const serverNotifications = ref([])
 const activityRows = ref([])
@@ -1248,23 +1250,110 @@ async function generateReport() {
 }
 
 async function runFullAgent() {
-  await runStep('agent', async () => {
-    ensureSources()
-    legacyKeywordRefreshTaskId.value = null
-    const payload = await api.post('/agent/run/', {
-      query: query.value,
-      sources: selectedSources.value,
+  ensureSources()
+  const topic = query.value.trim()
+  if (!topic) {
+    ElMessage.warning('请输入研究主题')
+    return
+  }
+  if (fullAgentStatus.value) return
+
+  const sections = ['abstract', 'introduction', 'methods', 'results', 'discussion']
+  const generatedDrafts = []
+  legacyKeywordRefreshTaskId.value = null
+  gapStats.value = emptyGapStats()
+  error.value = ''
+  task.value = null
+  analysis.value = null
+  experiment.value = null
+  drafts.value = []
+  report.value = null
+
+  try {
+    currentView.value = 'home'
+    await runPipelineStep('search', '第 1/5 步：正在检索真实文献并生成 RAG 综述...', async () => {
+      const payload = await api.post('/literature/search/', {
+        query: topic,
+        sources: selectedSources.value,
+        limit: 9,
+      })
+      task.value = payload.task
+      activeTab.value = 'literature'
+      await Promise.all([refreshDashboard(), fetchTrendStatistics(), refreshActivityData(), fetchNotifications()])
+      await fetchGapStatistics()
     })
-    task.value = payload.task
-    analysis.value = payload.analysis
-    experiment.value = payload.experiment
-    drafts.value = payload.drafts
-    report.value = payload.report
-    activeTab.value = 'report'
-    await Promise.all([refreshDashboard(), fetchTrendStatistics(), refreshActivityData(), fetchNotifications()])
-    await fetchGapStatistics()
-    ElMessage.success('完整科研智能体流程已完成')
-  })
+
+    await pauseBetweenAgentSteps()
+    await runPipelineStep('analysis', '第 2/5 步：正在逐篇抽取 LLM 主题词并分析研究空白...', async () => {
+      const payload = await api.post('/analysis/', { task_id: task.value.id })
+      analysis.value = payload.analysis
+      if (!isLegacyKeywordAnalysis(analysis.value)) legacyKeywordRefreshTaskId.value = null
+      activeTab.value = 'gaps'
+      await Promise.all([refreshDashboard(), refreshActivityData(), fetchNotifications()])
+    })
+
+    await pauseBetweenAgentSteps()
+    await runPipelineStep('experiment', '第 3/5 步：正在基于研究空白生成实验方案...', async () => {
+      const question = analysis.value?.gaps?.[0]?.suggested_question || topic
+      const payload = await api.post('/experiment/', {
+        analysis_id: analysis.value.id,
+        question,
+      })
+      experiment.value = payload.experiment
+      activeTab.value = 'report'
+      await Promise.all([refreshDashboard(), refreshActivityData(), fetchNotifications()])
+    })
+
+    for (let index = 0; index < sections.length; index += 1) {
+      const section = sections[index]
+      const label = draftSections.find((item) => item.key === section)?.label || section
+      await pauseBetweenAgentSteps()
+      await runPipelineStep(
+        'writing',
+        `第 4/5 步：正在串行生成论文${label}草稿（${index + 1}/${sections.length}）...`,
+        async () => {
+          const payload = await api.post('/writing/', {
+            experiment_id: experiment.value.id,
+            section,
+          })
+          generatedDrafts.push(payload.draft)
+          drafts.value = [...generatedDrafts]
+          await Promise.all([refreshActivityData(), fetchNotifications()])
+        },
+      )
+    }
+
+    await pauseBetweenAgentSteps()
+    await runPipelineStep('report', '第 5/5 步：正在整合文献、分析、方案和草稿生成研究报告...', async () => {
+      const payload = await api.post('/reports/', {
+        task_id: task.value.id,
+        experiment_id: experiment.value.id,
+      })
+      report.value = payload.report
+      activeTab.value = 'report'
+      currentView.value = 'report'
+      await Promise.all([refreshDashboard(), refreshActivityData(), fetchNotifications()])
+    })
+
+    fullAgentStatus.value = ''
+    ElMessage.success('完整科研流程已按顺序生成完成')
+  } catch (err) {
+    error.value = err.message || '一键生成失败'
+    ElMessage.error(error.value)
+  } finally {
+    fullAgentStatus.value = ''
+    loading.value = ''
+  }
+}
+
+async function runPipelineStep(name, status, callback) {
+  loading.value = name
+  fullAgentStatus.value = status
+  await callback()
+}
+
+function pauseBetweenAgentSteps() {
+  return new Promise((resolve) => window.setTimeout(resolve, 900))
 }
 
 async function refreshLegacyKeywordAnalysis() {

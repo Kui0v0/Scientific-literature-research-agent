@@ -26,11 +26,19 @@
               <h1>你好，{{ profile.name }}</h1>
               <p>欢迎使用科学文献研究智能体，开启高效的科研之旅！</p>
               <div class="hero-actions">
-                <el-button type="primary" :loading="loading === 'agent'" @click="runFullAgent">
+                <el-button type="primary" :loading="fullAgentRunning" @click="runFullAgent">
                   一键生成研究报告
                 </el-button>
                 <el-button :loading="loading === 'search'" @click="runSearch">仅检索文献</el-button>
               </div>
+              <el-alert
+                v-if="fullAgentStatus"
+                class="pipeline-alert"
+                type="info"
+                :title="fullAgentStatus"
+                show-icon
+                :closable="false"
+              />
             </div>
             <div class="hero-art" aria-hidden="true">
               <div class="platform"></div>
@@ -582,6 +590,7 @@ const props = defineProps([
   'roles',
   'logRows',
   'settings',
+  'fullAgentStatus',
   'runFullAgent',
   'runSearch',
   'openNotificationDrawer',
@@ -628,6 +637,7 @@ const selectedSourcesModel = computed({
 })
 
 const downloadButtonLabel = computed(() => `下载${props.settings?.reportFormat || 'Markdown'}`)
+const fullAgentRunning = computed(() => Boolean(props.fullAgentStatus))
 const downloadFilename = computed(() => {
   const format = String(props.settings?.reportFormat || 'Markdown').toLowerCase()
   const extension = format === 'pdf' ? 'pdf' : format === 'word' ? 'docx' : 'md'
