@@ -35,6 +35,7 @@
 │   │   │   ├── connectors.py   # PubMed / arXiv / Crossref 检索
 │   │   │   ├── llm.py          # 大模型调用
 │   │   │   ├── rag.py          # Milvus RAG 召回
+│   │   │   ├── rag_worker.py   # 隔离执行 Milvus 召回
 │   │   │   ├── analyzer.py     # 热点与研究空白
 │   │   │   ├── experiment.py   # 实验方案
 │   │   │   ├── writer.py       # 论文草稿
@@ -179,6 +180,10 @@ npm run dev
 | `RAG_EMBEDDING_BASE_URL` | OpenAI/Ollama 兼容 embedding 接口地址 |
 | `RAG_EMBEDDING_MODEL` | embedding 模型名，默认建议 `embeddinggemma` |
 | `RAG_RERANK_ENABLED` | `1` 启用本地 BGE rerank，`0` 关闭 |
+| `RAG_RERANK_ALLOW_TORCH` | `1` 允许加载本地 Torch/BGE rerank 模型，默认 `0` 避免额外资源占用 |
+| `SEARCH_REVIEW_TIMEOUT` | 检索接口等待大模型综述生成的秒数上限 |
+| `RAG_MILVUS_ISOLATE` / `RAG_MILVUS_TIMEOUT` | 独立子进程执行 Milvus 召回，以及子进程等待秒数上限 |
+| `MILVUS_RPC_TIMEOUT` / `MILVUS_TOKEN` | Milvus REST 请求超时和 token 认证配置 |
 | `NCBI_EMAIL` / `CROSSREF_MAILTO` | 建议填写，用于学术接口礼貌访问 |
 
 更多变量见 `.env.example` 和 `backend/.env.example`。

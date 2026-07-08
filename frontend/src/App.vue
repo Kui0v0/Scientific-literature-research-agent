@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <el-config-provider namespace="el">
     <LoginPanel
       v-if="!isAuthenticated"
@@ -195,6 +195,7 @@ import {
 
 const NOTIFICATION_READ_KEY = 'research-agent-notification-read-map'
 const SETTINGS_STORAGE_KEY = 'research-agent-settings'
+const DEFAULT_SOURCES = Object.freeze(['pubmed', 'arxiv', 'crossref'])
 const EMPTY_PROFILE = Object.freeze({
   name: '',
   role: '分析师',
@@ -221,7 +222,7 @@ const registerForm = reactive({
 })
 const currentView = ref('home')
 const query = ref('')
-const selectedSources = ref(['pubmed', 'arxiv', 'crossref'])
+const selectedSources = ref([...DEFAULT_SOURCES])
 const loading = ref('')
 const error = ref('')
 const activeTab = ref('literature')
@@ -265,11 +266,7 @@ const todoForm = reactive({
   dueDate: '',
   urgent: false,
 })
-const dashboard = ref({
-  stats: { tasks: 0, literature: 0, analyses: 0, summaries: 0, experiments: 0, reports: 0 },
-  recent_tasks: [],
-  source_distribution: [],
-})
+const dashboard = ref(emptyDashboard())
 const profile = reactive({ ...EMPTY_PROFILE })
 const profileForm = reactive({ ...EMPTY_PROFILE })
 const editingUserUsername = ref('')
@@ -397,11 +394,15 @@ const systemStatus = computed(() => {
   }
   const llm = health.llm || {}
   const rag = health.rag || {}
-  const milvusEnabled = rag.use_milvus ?? rag.enabled
+  const milvusValue = !rag.use_milvus
+    ? '未启用'
+    : rag.reachable === false
+      ? '未连接'
+      : `已连接：${rag.collection || '默认集合'}`
   return [
     { label: '服务运行状态', value: health.ok === false ? '异常' : '正常' },
     { label: '数据库连接', value: health.runtime?.db_engine ? '正常' : health.ok === false ? '未知' : '已配置' },
-    { label: 'Milvus 向量库', value: milvusEnabled ? `已启用：${rag.collection || '默认集合'}` : '未启用' },
+    { label: 'Milvus 向量库', value: milvusValue },
     { label: 'AI 模型服务', value: llm.enabled ? `${llm.provider || 'LLM'} 已启用` : '未启用' },
   ]
 })
@@ -577,6 +578,40 @@ function ensureSources() {
   if (!selectedSources.value.length) throw new Error('至少选择一个真实数据源')
 }
 
+function emptyDashboard() {
+  return {
+    stats: { tasks: 0, literature: 0, analyses: 0, summaries: 0, experiments: 0, reports: 0 },
+    recent_tasks: [],
+    source_distribution: [],
+  }
+}
+
+function resetResearchWorkspace() {
+  query.value = ''
+  selectedSources.value = [...DEFAULT_SOURCES]
+  loading.value = ''
+  error.value = ''
+  activeTab.value = 'literature'
+  trendRange.value = '2m'
+  trendStats.value = {
+    record_count: 0,
+    buckets: [],
+    series: [],
+    is_real: true,
+  }
+  trendLoading.value = false
+  gapStats.value = emptyGapStats()
+  gapLoading.value = false
+  task.value = null
+  analysis.value = null
+  legacyKeywordRefreshTaskId.value = null
+  experiment.value = null
+  drafts.value = []
+  report.value = null
+  fullAgentStatus.value = ''
+  dashboard.value = emptyDashboard()
+}
+
 function linePoints(values) {
   const xStart = 54
   const xGap = values.length > 1 ? 670 / (values.length - 1) : 0
@@ -624,7 +659,7 @@ async function fetchHealthStatus() {
   }
 }
 
-function applyAccount(account) {
+function applyAccount(account, options = {}) {
   const displayName = account.name || account.username || ''
   const nextProfile = {
     name: displayName,
@@ -639,9 +674,23 @@ function applyAccount(account) {
   Object.assign(profile, nextProfile)
   Object.assign(profileForm, nextProfile)
   isAuthenticated.value = true
-  currentView.value = 'home'
+  if (!options.keepView) currentView.value = 'home'
   error.value = ''
   expandedNotificationIds.value = []
+}
+
+async function ensureAuthenticatedSession() {
+  if (!isAuthenticated.value) {
+    throw new Error('请先登录后再使用检索功能')
+  }
+  const payload = await api.get('/auth/me/')
+  if (!payload.user) {
+    clearAuthenticatedState()
+    throw new Error('登录状态已失效，请重新登录')
+  }
+  api.setAuthToken(payload.auth_token || '')
+  applyAccount(payload.user, { keepView: true })
+  return payload.user
 }
 
 async function login() {
@@ -654,6 +703,7 @@ async function login() {
   loading.value = 'login'
   try {
     const payload = await api.post('/auth/login/', { username, password })
+    api.setAuthToken(payload.auth_token || '')
     applyAccount(payload.user)
     await loadAuthenticatedContext()
     ElMessage.success(`欢迎回来，${profile.name}`)
@@ -679,6 +729,7 @@ async function register() {
   loading.value = 'register'
   try {
     const payload = await api.post('/auth/register/', { name, username, password })
+    api.setAuthToken(payload.auth_token || '')
     applyAccount(payload.user)
     await loadAuthenticatedContext()
     registerForm.name = ''
@@ -697,8 +748,11 @@ async function restoreSession() {
   try {
     const payload = await api.get('/auth/me/')
     if (payload.user) {
+      api.setAuthToken(payload.auth_token || '')
       applyAccount(payload.user)
       await loadAuthenticatedContext()
+    } else {
+      clearAuthenticatedState()
     }
   } catch {
     clearAuthenticatedState()
@@ -709,6 +763,8 @@ async function restoreSession() {
 
 function clearAuthenticatedState() {
   isAuthenticated.value = false
+  api.clearAuthToken()
+  resetResearchWorkspace()
   users.value = []
   systemLogRows.value = []
   activityRows.value = []
@@ -909,8 +965,12 @@ async function fetchTodos() {
 }
 
 async function openNotificationDrawer() {
-  await fetchNotifications()
   notificationDrawerVisible.value = true
+  try {
+    await fetchNotifications()
+  } catch (err) {
+    ElMessage.warning(err.message || '通知刷新失败')
+  }
 }
 
 async function openActivityDrawer() {
@@ -1056,6 +1116,7 @@ async function deleteTodo(id) {
 async function runSearch() {
   currentView.value = 'literature'
   await runStep('search', async () => {
+    await ensureAuthenticatedSession()
     ensureSources()
     gapStats.value = emptyGapStats()
     legacyKeywordRefreshTaskId.value = null
@@ -1081,6 +1142,7 @@ async function runAnalysis() {
   if (!task.value) return
   currentView.value = currentView.value === 'home' ? 'home' : 'gaps'
   await runStep('analysis', async () => {
+    await ensureAuthenticatedSession()
     const payload = await api.post('/analysis/', { task_id: task.value.id })
     analysis.value = payload.analysis
     if (!isLegacyKeywordAnalysis(analysis.value)) {
@@ -1097,6 +1159,7 @@ async function generateExperiment() {
   if (!analysis.value) return
   currentView.value = currentView.value === 'home' ? 'home' : 'experiment'
   await runStep('experiment', async () => {
+    await ensureAuthenticatedSession()
     const question = analysis.value.gaps?.[0]?.suggested_question || query.value
     const payload = await api.post('/experiment/', {
       analysis_id: analysis.value.id,
@@ -1114,6 +1177,7 @@ async function generateDraft(section) {
   if (!experiment.value) return
   currentView.value = 'writing'
   await runStep(`writing-${section}`, async () => {
+    await ensureAuthenticatedSession()
     const payload = await api.post('/writing/', {
       experiment_id: experiment.value.id,
       section,
@@ -1130,6 +1194,7 @@ async function generateAllDrafts() {
   currentView.value = currentView.value === 'home' ? 'home' : 'writing'
   const sections = ['abstract', 'introduction', 'methods', 'results', 'discussion']
   await runStep('writing', async () => {
+    await ensureAuthenticatedSession()
     const generated = []
     for (const section of sections) {
       const payload = await api.post('/writing/', {
@@ -1151,6 +1216,7 @@ async function generateReport() {
   if (!task.value) return
   currentView.value = currentView.value === 'home' ? 'home' : 'report'
   await runStep('report', async () => {
+    await ensureAuthenticatedSession()
     const payload = await api.post('/reports/', {
       task_id: task.value.id,
       experiment_id: experiment.value?.id,
@@ -1184,6 +1250,7 @@ async function runFullAgent() {
 
   try {
     currentView.value = 'home'
+    await ensureAuthenticatedSession()
     await runPipelineStep('search', '第 1/5 步：正在检索真实文献并生成 RAG 综述...', async () => {
       const payload = await api.post('/literature/search/', {
         query: topic,

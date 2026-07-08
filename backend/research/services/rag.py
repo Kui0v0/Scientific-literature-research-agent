@@ -1,11 +1,17 @@
+import base64
 import hashlib
 import json
 import math
 import os
+import subprocess
+import socket
+import sys
 import urllib.request
+from pathlib import Path
 
 
 _RERANKER = None
+_LAST_RAG_STATUS = "尚未执行 Milvus 向量召回"
 
 
 def env_int(name, default, minimum=None, maximum=None):
@@ -25,9 +31,10 @@ def retrieve_evidence(query, records, limit=None):
     documents = [_document_from_record(record, index) for index, record in enumerate(records or [], start=1)]
     documents = [doc for doc in documents if doc["title"] or doc["abstract"]]
     if not documents:
+        _set_rag_status("没有可用于向量召回的文献标题或摘要")
         return []
 
-    evidence = _finalize_evidence(_milvus_retrieve(query, documents, limit), limit)
+    evidence = _finalize_evidence(_safe_milvus_retrieve(query, documents, limit), limit)
     if evidence:
         return evidence
     if os.getenv("RAG_RECORD_CONTEXT_FALLBACK", "1") != "1":
@@ -66,49 +73,108 @@ def evidence_reference_note(documents):
 
 def evidence_generation_label(documents):
     if documents and all(doc.get("retrieval_fallback") for doc in documents):
-        return "真实文献上下文约束（Milvus/embedding 暂未返回向量证据）"
+        return f"真实文献上下文约束（{rag_status_message()}）"
     return "Milvus RAG 证据约束"
+
+
+def rag_status_message():
+    return _LAST_RAG_STATUS
+
+
+def rag_config_status():
+    host = os.getenv("MILVUS_HOST", "127.0.0.1")
+    port = os.getenv("MILVUS_PORT", "19530")
+    enabled = os.getenv("USE_MILVUS", "1") == "1"
+    return {
+        "use_milvus": enabled,
+        "host": host,
+        "port": port,
+        "collection": os.getenv("MILVUS_COLLECTION", "literature_rag_chunks"),
+        "reachable": _tcp_available(host, port) if enabled else False,
+        "embedding_model": _embedding_model(),
+        "embedding_base_url": _embedding_base_url(),
+        "last_status": rag_status_message(),
+    }
+
+
+def _safe_milvus_retrieve(query, documents, limit):
+    if os.getenv("RAG_MILVUS_ISOLATE", "1") != "1":
+        return _milvus_retrieve(query, documents, limit)
+    return _isolated_milvus_retrieve(query, documents, limit)
+
+
+def _isolated_milvus_retrieve(query, documents, limit):
+    timeout = env_int("RAG_MILVUS_TIMEOUT", 35, minimum=5, maximum=180)
+    backend_dir = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(backend_dir) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONWARNINGS"] = "ignore"
+    payload = json.dumps(
+        {
+            "query": query,
+            "documents": documents,
+            "limit": limit,
+        },
+        ensure_ascii=False,
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "research.services.rag_worker"],
+            input=payload,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=timeout,
+            cwd=str(backend_dir),
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        _set_rag_status(f"Milvus 子进程超过 {timeout} 秒未返回，已使用真实文献上下文兜底。")
+        return []
+    except Exception as exc:
+        _set_rag_status(f"Milvus 子进程启动失败：{type(exc).__name__}: {_safe_error_detail(exc)}")
+        return []
+
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    if completed.returncode != 0:
+        detail = _safe_error_detail(stderr or stdout or f"exit code {completed.returncode}")
+        _set_rag_status(f"Milvus 子进程异常退出：{detail}")
+        return []
+    try:
+        result = json.loads(stdout or "{}")
+    except json.JSONDecodeError:
+        detail = _safe_error_detail(stderr or stdout or "empty response")
+        _set_rag_status(f"Milvus 子进程返回内容无法解析：{detail}")
+        return []
+    if result.get("status"):
+        _set_rag_status(result.get("status"))
+    if result.get("ok") is False:
+        _set_rag_status(result.get("status") or result.get("error") or "Milvus 子进程召回失败")
+        return []
+    return result.get("documents") or []
 
 
 def _milvus_retrieve(query, documents, limit):
     if os.getenv("USE_MILVUS", "1") != "1":
+        _set_rag_status("USE_MILVUS 未启用")
         return []
     try:
-        from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, connections, utility
-
         texts = [_document_text(doc) for doc in documents]
         vectors = _embed_texts([query] + texts)
         if len(vectors) != len(documents) + 1:
+            _set_rag_status(f"embedding 返回数量不匹配：期望 {len(documents) + 1} 条，实际 {len(vectors)} 条")
             return []
         query_vector = vectors[0]
         document_vectors = vectors[1:]
         dim = len(query_vector)
         collection_name = os.getenv("MILVUS_COLLECTION", "literature_rag_chunks")
-        connect_kwargs = {
-            "alias": "default",
-            "host": os.getenv("MILVUS_HOST", "127.0.0.1"),
-            "port": os.getenv("MILVUS_PORT", "19530"),
-            "secure": os.getenv("MILVUS_SECURE", "0") == "1",
-        }
-        if os.getenv("MILVUS_USER"):
-            connect_kwargs["user"] = os.getenv("MILVUS_USER")
-        if os.getenv("MILVUS_PASSWORD"):
-            connect_kwargs["password"] = os.getenv("MILVUS_PASSWORD")
-        connections.connect(**connect_kwargs)
-        collection_name = _collection_name_for_dimension(collection_name, dim, Collection, utility)
-        if not utility.has_collection(collection_name):
-            fields = [
-                FieldSchema(name="pk", dtype=DataType.VARCHAR, max_length=96, is_primary=True),
-                FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=dim),
-                FieldSchema(name="payload", dtype=DataType.JSON),
-            ]
-            schema = CollectionSchema(fields, description="Literature RAG evidence chunks")
-            collection = Collection(collection_name, schema=schema)
-            collection.create_index("vector", _milvus_index_params())
-        else:
-            collection = Collection(collection_name)
-            if not collection.indexes:
-                collection.create_index("vector", _milvus_index_params())
+        rpc_timeout = env_int("MILVUS_RPC_TIMEOUT", 12, minimum=2, maximum=60)
+        collection_name = _collection_name_for_dimension_rest(collection_name, dim, rpc_timeout)
+        if not _milvus_rest_has_collection(collection_name, rpc_timeout):
+            _milvus_rest_create_collection(collection_name, dim, rpc_timeout)
 
         rows = [
             {
@@ -123,30 +189,46 @@ def _milvus_retrieve(query, documents, limit):
             }
             for doc, vector in zip(documents, document_vectors)
         ]
-        if hasattr(collection, "upsert"):
-            collection.upsert(rows)
-        else:
-            collection.insert(rows)
-        collection.flush()
-        collection.load()
-
-        hits = collection.search(
-            data=[query_vector],
-            anns_field="vector",
-            param=_milvus_search_params(),
-            limit=min(_candidate_limit(limit), len(rows)),
-            expr=_pk_filter_expr(row["pk"] for row in rows),
-            output_fields=["payload"],
+        _milvus_rest_request(
+            "entities/upsert",
+            {"collectionName": collection_name, "data": rows},
+            timeout=rpc_timeout,
         )
+        _milvus_rest_request(
+            "collections/load",
+            {"collectionName": collection_name},
+            timeout=rpc_timeout,
+        )
+
+        result = _milvus_rest_request(
+            "entities/search",
+            {
+                "collectionName": collection_name,
+                "data": [query_vector],
+                "annsField": "vector",
+                "searchParams": _milvus_rest_search_params(),
+                "limit": min(_candidate_limit(limit), len(rows)),
+                "filter": _pk_filter_expr(row["pk"] for row in rows),
+                "outputFields": ["payload"],
+            },
+            timeout=rpc_timeout,
+        )
+        hits = result.get("data") or []
         output = []
-        for hit in hits[0]:
-            payload = hit.entity.get("payload")
+        for hit in hits:
+            entity = hit.get("entity") or hit
+            payload = _decode_milvus_payload(entity.get("payload"))
             if payload:
                 doc = dict(payload)
-                doc["vector_score"] = float(getattr(hit, "score", getattr(hit, "distance", 0.0)) or 0.0)
+                doc["vector_score"] = float(hit.get("score", hit.get("distance", 0.0)) or 0.0)
                 output.append(doc)
+        if output:
+            _set_rag_status(f"Milvus 向量召回成功：{len(output)} 条，集合 {collection_name}")
+        else:
+            _set_rag_status(f"Milvus 查询成功，但当前文献集合没有命中结果：{collection_name}")
         return _rerank_evidence(query, output, limit)
-    except Exception:
+    except Exception as exc:
+        _set_rag_status(f"Milvus 向量召回失败：{type(exc).__name__}: {_safe_error_detail(exc)}")
         return []
 
 
@@ -224,6 +306,125 @@ def _embedding_url():
     return base_url if base_url.endswith("/embeddings") else f"{base_url}/embeddings"
 
 
+def _milvus_uri():
+    scheme = "https" if os.getenv("MILVUS_SECURE", "0") == "1" else "http"
+    host = os.getenv("MILVUS_HOST", "127.0.0.1")
+    port = os.getenv("MILVUS_PORT", "19530")
+    return f"{scheme}://{host}:{port}"
+
+
+def _milvus_rest_request(endpoint, body, timeout=None):
+    url = f"{_milvus_uri().rstrip('/')}/v2/vectordb/{endpoint.lstrip('/')}"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    token = os.getenv("MILVUS_TOKEN", "").strip()
+    user = os.getenv("MILVUS_USER", "").strip()
+    password = os.getenv("MILVUS_PASSWORD", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    elif user and password:
+        headers["Authorization"] = f"Bearer {user}:{password}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body or {}, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout or env_int("MILVUS_RPC_TIMEOUT", 12, minimum=2, maximum=60)) as response:
+        result = json.loads(response.read().decode("utf-8", errors="ignore") or "{}")
+    if int(result.get("code", 0) or 0) != 0:
+        raise RuntimeError(result.get("message") or result.get("error") or f"Milvus REST {endpoint} failed")
+    return result
+
+
+def _milvus_rest_has_collection(collection_name, timeout):
+    result = _milvus_rest_request("collections/has", {"collectionName": collection_name}, timeout=timeout)
+    data = result.get("data")
+    if isinstance(data, dict):
+        return bool(data.get("has"))
+    return bool(data)
+
+
+def _milvus_rest_describe_collection(collection_name, timeout):
+    return _milvus_rest_request("collections/describe", {"collectionName": collection_name}, timeout=timeout).get("data") or {}
+
+
+def _milvus_rest_create_collection(collection_name, dim, timeout):
+    metric_type = _milvus_metric_type()
+    index_type = os.getenv("MILVUS_INDEX_TYPE", "FLAT").upper()
+    _milvus_rest_request(
+        "collections/create",
+        {
+            "collectionName": collection_name,
+            "schema": {
+                "autoId": False,
+                "enableDynamicField": False,
+                "description": "Literature RAG evidence chunks",
+                "fields": [
+                    {
+                        "fieldName": "pk",
+                        "dataType": "VarChar",
+                        "isPrimary": True,
+                        "elementTypeParams": {"max_length": "96"},
+                    },
+                    {
+                        "fieldName": "vector",
+                        "dataType": "FloatVector",
+                        "elementTypeParams": {"dim": str(dim)},
+                    },
+                    {"fieldName": "payload", "dataType": "JSON"},
+                ],
+            },
+            "indexParams": [
+                {
+                    "fieldName": "vector",
+                    "indexName": "vector",
+                    "metricType": metric_type,
+                    "indexType": index_type,
+                    "params": {},
+                }
+            ],
+        },
+        timeout=timeout,
+    )
+
+
+def _milvus_rest_search_params():
+    return {
+        "metricType": _milvus_metric_type(),
+        "params": {},
+    }
+
+
+def _decode_milvus_payload(payload):
+    if isinstance(payload, dict):
+        return payload
+    if not payload:
+        return {}
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8", errors="ignore")
+    if not isinstance(payload, str):
+        return {}
+    for candidate in (payload, _try_base64_decode(payload)):
+        if not candidate:
+            continue
+        try:
+            value = json.loads(candidate)
+            return value if isinstance(value, dict) else {}
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+
+def _try_base64_decode(value):
+    try:
+        return base64.b64decode(value).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
 def _embed_texts(texts):
     texts = [str(text or "") for text in texts]
     if not texts:
@@ -247,13 +448,16 @@ def _embed_texts(texts):
         timeout = env_int("RAG_EMBEDDING_TIMEOUT", 30, minimum=3, maximum=180)
         with urllib.request.urlopen(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8", errors="ignore"))
-    except Exception:
+    except Exception as exc:
+        detail = _safe_error_detail(exc)
         if len(texts) == 1:
+            _set_rag_status(f"embedding 请求失败：{detail}")
             return []
         vectors = []
         for text in texts:
             single = _embed_texts([text])
             if not single:
+                _set_rag_status(f"embedding 请求失败：{detail}")
                 return []
             vectors.extend(single)
         return vectors
@@ -261,7 +465,19 @@ def _embed_texts(texts):
     data = result.get("data") or []
     data = sorted(data, key=lambda item: item.get("index", 0))
     vectors = [_normalize_vector(item.get("embedding") or []) for item in data]
-    return [vector for vector in vectors if vector]
+    vectors = [vector for vector in vectors if vector]
+    if len(vectors) != len(texts) and len(texts) > 1:
+        output = []
+        for text in texts:
+            single = _embed_texts([text])
+            if not single:
+                _set_rag_status(
+                    f"embedding 批量返回数量不匹配，且单条重试失败：期望 {len(texts)} 条，实际 {len(vectors)} 条"
+                )
+                return []
+            output.extend(single)
+        return output
+    return vectors
 
 
 def _normalize_vector(vector):
@@ -270,21 +486,28 @@ def _normalize_vector(vector):
     return [value / norm for value in values]
 
 
-def _collection_name_for_dimension(collection_name, dim, Collection, utility):
-    if not utility.has_collection(collection_name):
+def _collection_name_for_dimension_rest(collection_name, dim, timeout):
+    if not _milvus_rest_has_collection(collection_name, timeout):
         return collection_name
-    collection = Collection(collection_name)
-    existing_dim = _collection_vector_dim(collection)
+    existing_dim = _collection_vector_dim_from_description(
+        _milvus_rest_describe_collection(collection_name, timeout)
+    )
     if not existing_dim or existing_dim == dim:
         return collection_name
     return f"{collection_name}_{dim}"
 
 
-def _collection_vector_dim(collection):
-    for field in collection.schema.fields:
-        if field.name != "vector":
+def _collection_vector_dim_from_description(description):
+    for field in (description or {}).get("fields", []):
+        if (field.get("name") or field.get("fieldName")) != "vector":
             continue
-        params = getattr(field, "params", {}) or {}
+        params = field.get("params") or field.get("elementTypeParams") or {}
+        if isinstance(params, list):
+            params = {
+                str(item.get("key")): item.get("value")
+                for item in params
+                if isinstance(item, dict) and item.get("key") is not None
+            }
         try:
             return int(params.get("dim") or 0)
         except (TypeError, ValueError):
@@ -294,21 +517,6 @@ def _collection_vector_dim(collection):
 
 def _milvus_metric_type():
     return os.getenv("MILVUS_METRIC_TYPE", "IP").upper()
-
-
-def _milvus_index_params():
-    return {
-        "metric_type": _milvus_metric_type(),
-        "index_type": os.getenv("MILVUS_INDEX_TYPE", "FLAT").upper(),
-        "params": {},
-    }
-
-
-def _milvus_search_params():
-    return {
-        "metric_type": _milvus_metric_type(),
-        "params": {},
-    }
 
 
 def _candidate_limit(limit):
@@ -349,6 +557,9 @@ def _rerank_evidence(query, documents, limit):
 def _load_reranker():
     global _RERANKER
     if os.getenv("RAG_RERANK_ENABLED", "0") != "1":
+        return None
+    if os.getenv("RAG_RERANK_ALLOW_TORCH", "0") != "1":
+        _RERANKER = False
         return None
     if _RERANKER is False:
         return None
@@ -412,10 +623,27 @@ def _record_context_evidence(documents, limit):
     output = []
     for doc in documents[:limit]:
         item = dict(doc)
-        item["retrieval"] = "文献上下文（Milvus 或 embedding 暂未返回向量证据）"
+        item["retrieval"] = f"文献上下文兜底（{rag_status_message()}）"
         item["retrieval_fallback"] = True
         output.append(item)
     return _finalize_evidence(output, limit)
+
+
+def _set_rag_status(message):
+    global _LAST_RAG_STATUS
+    _LAST_RAG_STATUS = str(message or "").strip()[:500] or "Milvus 向量召回状态未知"
+
+
+def _tcp_available(host, port):
+    try:
+        with socket.create_connection((host, int(port)), timeout=1.5):
+            return True
+    except Exception:
+        return False
+
+
+def _safe_error_detail(exc):
+    return str(exc).replace("\n", " ")[:240]
 
 
 def _retrieval_line(doc):

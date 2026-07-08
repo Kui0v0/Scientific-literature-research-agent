@@ -4,14 +4,18 @@ from pathlib import Path
 from django.core.management.utils import get_random_secret_key
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+PROJECT_DIR = BASE_DIR.parent
+ENV_FILES = [PROJECT_DIR / ".env", BASE_DIR / ".env"]
 
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(BASE_DIR / ".env", override=True)
+    for env_file in ENV_FILES:
+        load_dotenv(env_file, override=True)
 except Exception:
-    env_path = BASE_DIR / ".env"
-    if env_path.exists():
+    for env_path in ENV_FILES:
+        if not env_path.exists():
+            continue
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:

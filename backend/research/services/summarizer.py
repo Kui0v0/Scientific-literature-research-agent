@@ -1,14 +1,29 @@
+import concurrent.futures
 from collections import Counter
 
 from .llm import LLMError, chat_completion, fallback_notice, generation_notice, llm_enabled, set_llm_status
 from .rag import env_int, evidence_generation_label, format_evidence_pack, retrieve_evidence
 
 
-def generate_review(query, records):
-    llm_text = _try_llm_review(query, records)
+def generate_review(query, records, timeout_seconds=None):
+    llm_text = _try_llm_review_with_timeout(query, records, timeout_seconds)
     if llm_text:
         return llm_text
     return _heuristic_review(query, records)
+
+
+def _try_llm_review_with_timeout(query, records, timeout_seconds=None):
+    if not timeout_seconds:
+        return _try_llm_review(query, records)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_try_llm_review, query, records)
+    try:
+        return future.result(timeout=max(1, int(timeout_seconds)))
+    except concurrent.futures.TimeoutError:
+        set_llm_status(f"文献检索摘要生成超过 {int(timeout_seconds)} 秒，已先返回规则兜底摘要。")
+        return ""
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _try_llm_review(query, records):

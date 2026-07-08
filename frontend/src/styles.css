@@ -761,6 +761,7 @@ a {
 }
 
 .panel {
+  min-width: 0;
   padding: 20px;
   background: rgba(255, 255, 255, 0.96);
   border: 1px solid #e4ebf5;
@@ -1528,9 +1529,11 @@ a {
 .gap-list {
   display: grid;
   gap: 12px;
+  min-width: 0;
 }
 
 .gap-row {
+  min-width: 0;
   padding: 14px;
   background: #f8fbff;
   border: 1px solid #e7edf7;
@@ -1540,6 +1543,7 @@ a {
 .gap-row strong {
   display: block;
   margin-bottom: 6px;
+  overflow-wrap: anywhere;
 }
 
 .gap-meta {
@@ -1556,6 +1560,24 @@ a {
   margin: 0 0 10px;
   color: #506078;
   line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.gap-question.el-tag {
+  display: inline-flex;
+  align-items: flex-start;
+  max-width: 100%;
+  height: auto;
+  min-height: 24px;
+  padding: 4px 10px;
+  white-space: normal;
+  line-height: 1.5;
+}
+
+.gap-question .el-tag__content {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .footer {

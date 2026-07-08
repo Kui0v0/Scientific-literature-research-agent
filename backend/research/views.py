@@ -2,11 +2,13 @@ import json
 import math
 import os
 import re
+import sys
 from datetime import date, timedelta
 
 from django.conf import settings
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import Group, User
+from django.core import signing
 from django.db import connection
 from django.db.models import Count, Q
 from django.http import HttpResponse, JsonResponse
@@ -32,6 +34,7 @@ from .services.connectors import RetrievalError, search_literature
 from .services.experiment import build_experiment_plan
 from .services.exporters import report_filename, render_report_docx, render_report_pdf
 from .services.llm import llm_config_status
+from .services.rag import env_int, rag_config_status
 from .services.report import build_report
 from .services.serializers import (
     analysis_to_dict,
@@ -351,17 +354,14 @@ def health(request):
         "status": "ok",
         "name": "scientific-literature-agent",
         "llm": llm_config_status(),
-        "rag": {
-            "use_milvus": os.getenv("USE_MILVUS", "1") == "1",
-            "host": os.getenv("MILVUS_HOST", "127.0.0.1"),
-            "port": os.getenv("MILVUS_PORT", "19530"),
-            "collection": os.getenv("MILVUS_COLLECTION", "literature_rag_chunks"),
-        },
+        "rag": rag_config_status(),
     }
     if settings.DEBUG:
         payload["runtime"] = {
             "pid": os.getpid(),
             "cwd": os.getcwd(),
+            "python": sys.executable,
+            "python_version": sys.version.split()[0],
             "db_engine": connection.settings_dict.get("ENGINE", ""),
             "db_name": os.path.basename(db_name) or db_name,
         }
@@ -370,6 +370,26 @@ def health(request):
 
 @require_http_methods(["GET"])
 def trend_statistics(request):
+    user = current_user(request)
+    if not user:
+        return api_ok(
+            {
+                "range": request.GET.get("range", "2m"),
+                "is_real": True,
+                "date_basis": "published_at_or_retrieved_at",
+                "category_basis": "content_classification",
+                "record_count": 0,
+                "bucket_days": 0,
+                "start_date": "",
+                "end_date": "",
+                "buckets": [],
+                "categories": [
+                    {"id": area["id"], "name": area["name"], "english": area["english"], "color": area["color"]}
+                    for area in RESEARCH_AREAS
+                ],
+                "series": [],
+            }
+        )
     range_key = request.GET.get("range", "2m")
     days = 180 if range_key == "6m" else 60
     bucket_count = 12 if range_key == "6m" else 9
@@ -391,6 +411,7 @@ def trend_statistics(request):
             Q(published_at__gte=start_date, published_at__lte=end_date)
             | Q(created_at__date__gte=start_date, created_at__date__lte=end_date)
         )
+        .filter(task__owner=user)
         .exclude(source__iexact="Demo")
         .select_related("task")
     )
@@ -442,6 +463,9 @@ def trend_statistics(request):
 
 @require_http_methods(["GET"])
 def gap_statistics(request):
+    user = current_user(request)
+    if not user:
+        return api_ok(_empty_gap_statistics_payload())
     task = _gap_statistics_task(request)
     if not task:
         return api_ok(_empty_gap_statistics_payload())
@@ -451,7 +475,9 @@ def gap_statistics(request):
 
     query = (request.GET.get("query") or task.query).strip()
     area = _dominant_research_area(current_records, query)
-    all_real_records = list(LiteratureRecord.objects.exclude(source__iexact="Demo").select_related("task"))
+    all_real_records = list(
+        LiteratureRecord.objects.filter(task__owner=user).exclude(source__iexact="Demo").select_related("task")
+    )
     field_records = [record for record in all_real_records if _classify_research_area(record)["id"] == area["id"]]
     if current_records and not field_records:
         field_records = current_records
@@ -497,6 +523,9 @@ def gap_statistics(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def search(request):
+    user = current_user(request)
+    if not user:
+        return api_error("请先登录后再使用检索功能", status=401)
     data = parse_json(request)
     query = data.get("query", "").strip()
     sources = data.get("sources") or ["pubmed", "arxiv", "crossref"]
@@ -504,7 +533,7 @@ def search(request):
         return api_error("研究主题不能为空", status=400)
 
     task = SearchTask.objects.create(
-        owner=current_user(request),
+        owner=user,
         query=query,
         sources=sources,
         status=SearchTask.Status.RUNNING,
@@ -514,7 +543,11 @@ def search(request):
         for payload in records_payload:
             LiteratureRecord.objects.create(task=task, **payload)
         task.result_count = len(records_payload)
-        task.review_text = generate_review(query, records_payload)
+        task.review_text = generate_review(
+            query,
+            records_payload,
+            timeout_seconds=env_int("SEARCH_REVIEW_TIMEOUT", 45, minimum=5, maximum=120),
+        )
         task.status = SearchTask.Status.DONE
         task.save(update_fields=["result_count", "review_text", "status", "updated_at"])
         log_action(request, "literature.search", {"query": query, "sources": sources, "count": task.result_count})
@@ -532,7 +565,10 @@ def search(request):
 
 
 def task_detail(request, task_id):
-    task = get_object_or_404(SearchTask, id=task_id)
+    user = current_user(request)
+    if not user:
+        return api_error("请先登录", status=401)
+    task = get_object_or_404(SearchTask, id=task_id, owner=user)
     payload = {"task": task_to_dict(task)}
     analysis = _analysis_for_response(task)
     if analysis:
@@ -543,8 +579,11 @@ def task_detail(request, task_id):
 @csrf_exempt
 @require_http_methods(["POST"])
 def analyze(request):
+    user = current_user(request)
+    if not user:
+        return api_error("请先登录", status=401)
     data = parse_json(request)
-    task = get_object_or_404(SearchTask, id=data.get("task_id"))
+    task = get_object_or_404(SearchTask, id=data.get("task_id"), owner=user)
     analysis = _run_analysis_for_task(task)
     log_action(request, "analysis.run", {"task_id": task.id, "gap_count": len(analysis.gaps)})
     return api_ok({"analysis": analysis_to_dict(analysis)})
@@ -587,15 +626,18 @@ def _run_analysis_for_task(task):
 @csrf_exempt
 @require_http_methods(["POST"])
 def experiment(request):
+    user = current_user(request)
+    if not user:
+        return api_error("请先登录", status=401)
     data = parse_json(request)
-    analysis = get_object_or_404(AnalysisResult, id=data.get("analysis_id"))
+    analysis = get_object_or_404(AnalysisResult, id=data.get("analysis_id"), task__owner=user)
     analysis = _ensure_current_analysis(analysis)
     analysis_payload = analysis_to_dict(analysis)
     default_question = analysis.gaps[0]["suggested_question"] if analysis.gaps else analysis.task.query
     question = data.get("question") or default_question
     records_payload = [record_to_dict(record) for record in analysis.task.records.all()]
     plan_payload = build_experiment_plan(question, analysis_payload, records_payload)
-    plan = ExperimentPlan.objects.create(owner=current_user(request), analysis=analysis, **plan_payload)
+    plan = ExperimentPlan.objects.create(owner=user, analysis=analysis, **plan_payload)
     log_action(request, "experiment.create", {"analysis_id": analysis.id, "question": question})
     return api_ok({"experiment": experiment_to_dict(plan)})
 
@@ -603,8 +645,11 @@ def experiment(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def writing(request):
+    user = current_user(request)
+    if not user:
+        return api_error("请先登录", status=401)
     data = parse_json(request)
-    plan = get_object_or_404(ExperimentPlan, id=data.get("experiment_id"))
+    plan = get_object_or_404(ExperimentPlan, id=data.get("experiment_id"), owner=user)
     if plan.analysis:
         plan.analysis = _ensure_current_analysis(plan.analysis)
     query = plan.analysis.task.query if plan.analysis else plan.question
@@ -619,7 +664,7 @@ def writing(request):
         records=records_payload,
         analysis_payload=analysis_payload,
     )
-    draft = WritingDraft.objects.create(owner=current_user(request), experiment=plan, **draft_payload)
+    draft = WritingDraft.objects.create(owner=user, experiment=plan, **draft_payload)
     log_action(request, "writing.generate", {"experiment_id": plan.id, "section": draft.section})
     return api_ok({"draft": draft_to_dict(draft)})
 
@@ -627,15 +672,18 @@ def writing(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def report(request):
+    user = current_user(request)
+    if not user:
+        return api_error("请先登录", status=401)
     data = parse_json(request)
-    task = get_object_or_404(SearchTask, id=data.get("task_id"))
+    task = get_object_or_404(SearchTask, id=data.get("task_id"), owner=user)
     analysis = _analysis_for_response(task)
     analysis_payload = analysis_to_dict(analysis) if analysis else {}
     plan = None
     if data.get("experiment_id"):
-        plan = get_object_or_404(ExperimentPlan, id=data.get("experiment_id"))
+        plan = get_object_or_404(ExperimentPlan, id=data.get("experiment_id"), owner=user)
     elif analysis:
-        plan = analysis.experiment_plans.order_by("-created_at").first()
+        plan = analysis.experiment_plans.filter(owner=user).order_by("-created_at").first()
     drafts = list(plan.drafts.all()) if plan else []
     report_payload = build_report(
         task,
@@ -644,25 +692,34 @@ def report(request):
         experiment=experiment_to_dict(plan) if plan else {},
         drafts=drafts,
     )
-    item = Report.objects.create(owner=current_user(request), task=task, **report_payload)
+    item = Report.objects.create(owner=user, task=task, **report_payload)
     log_action(request, "report.create", {"task_id": task.id, "report_id": item.id})
     return api_ok({"report": report_to_dict(item)})
 
 
 def report_detail(request, report_id):
-    item = get_object_or_404(Report, id=report_id)
+    user = current_user(request)
+    if not user:
+        return api_error("请先登录", status=401)
+    item = get_object_or_404(Report, id=report_id, owner=user)
     return api_ok({"report": report_to_dict(item)})
 
 
 def report_markdown(request, report_id):
-    item = get_object_or_404(Report, id=report_id)
+    user = current_user(request)
+    if not user:
+        return api_error("请先登录", status=401)
+    item = get_object_or_404(Report, id=report_id, owner=user)
     response = HttpResponse(item.content_md, content_type="text/markdown; charset=utf-8")
     response["Content-Disposition"] = f'attachment; filename="report-{item.id}.md"'
     return response
 
 
 def report_download(request, report_id):
-    item = get_object_or_404(Report, id=report_id)
+    user = current_user(request)
+    if not user:
+        return api_error("请先登录", status=401)
+    item = get_object_or_404(Report, id=report_id, owner=user)
     export_format = (request.GET.get("format") or "markdown").strip().lower()
     if export_format in {"md", "markdown"}:
         response = HttpResponse(item.content_md, content_type="text/markdown; charset=utf-8")
@@ -693,6 +750,9 @@ def report_download(request, report_id):
 @csrf_exempt
 @require_http_methods(["POST"])
 def agent_run(request):
+    user = current_user(request)
+    if not user:
+        return api_error("请先登录", status=401)
     data = parse_json(request)
     query = data.get("query", "").strip()
     if not query:
@@ -701,7 +761,7 @@ def agent_run(request):
         task, analysis, plan, drafts, item = run_full_research_flow(
             query,
             data.get("sources") or ["pubmed", "arxiv", "crossref"],
-            user=current_user(request),
+            user=user,
         )
     except RetrievalError as exc:
         return api_error(str(exc), status=424)
@@ -741,11 +801,14 @@ def api_error(message, status=400):
 
 
 def _gap_statistics_task(request):
+    user = current_user(request)
+    if not user:
+        return None
     task_id = request.GET.get("task_id")
     if not task_id:
         return None
     try:
-        return SearchTask.objects.get(id=int(task_id), status=SearchTask.Status.DONE)
+        return SearchTask.objects.get(id=int(task_id), owner=user, status=SearchTask.Status.DONE)
     except (SearchTask.DoesNotExist, TypeError, ValueError):
         return None
 
@@ -1028,7 +1091,7 @@ def register(request):
     profile.save(update_fields=["display_name", "avatar_text", "updated_at"])
     log_action(request, "register", {"username": username, "role": "分析师"}, user=user)
     login(request, user)
-    return api_ok({"user": user_payload(user)})
+    return api_ok({"user": user_payload(user), "auth_token": auth_token_for_user(user)})
 
 
 @csrf_exempt
@@ -1046,7 +1109,7 @@ def login_view(request):
         return api_error("该账号已停用", status=403)
     login(request, user)
     log_action(request, "login", {"username": user.username}, user=user)
-    return api_ok({"user": user_payload(user)})
+    return api_ok({"user": user_payload(user), "auth_token": auth_token_for_user(user)})
 
 
 @csrf_exempt
@@ -1059,7 +1122,7 @@ def logout_view(request):
 
 def me(request):
     user = current_user(request)
-    return api_ok({"user": user_payload(user) if user else None})
+    return api_ok({"user": user_payload(user) if user else None, "auth_token": auth_token_for_user(user) if user else ""})
 
 
 @csrf_exempt
@@ -1304,7 +1367,25 @@ def todo_detail(request, todo_id):
 def current_user(request):
     if request.user.is_authenticated:
         return request.user
-    return None
+    token = request.headers.get("X-Research-Auth") or request.GET.get("auth_token") or ""
+    if not token:
+        return None
+    try:
+        payload = signing.loads(token, salt="research-agent-auth", max_age=60 * 60 * 24 * 7)
+        user_id = int(payload.get("user_id"))
+    except Exception:
+        return None
+    try:
+        user = User.objects.get(id=user_id, is_active=True)
+    except User.DoesNotExist:
+        return None
+    return user
+
+
+def auth_token_for_user(user):
+    if not user:
+        return ""
+    return signing.dumps({"user_id": user.id}, salt="research-agent-auth")
 
 
 def user_payload(user):

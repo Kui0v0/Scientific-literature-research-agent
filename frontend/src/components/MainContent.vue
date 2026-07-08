@@ -1,4 +1,4 @@
-﻿<template>
+<template>
       <main class="main">
         <AppTopbar
           v-model:query="queryModel"
@@ -335,7 +335,7 @@
                     <span v-if="gap.evidence_count">证据记录 {{ gap.evidence_count }} 条</span>
                   </div>
                   <p>{{ gap.rationale }}</p>
-                  <el-tag type="warning" effect="light">{{ gap.suggested_question }}</el-tag>
+                  <el-tag class="gap-question" type="warning" effect="light">{{ gap.suggested_question }}</el-tag>
                 </article>
               </div>
               <el-empty v-else description="暂无研究空白" />
@@ -668,7 +668,7 @@ function generationMode(item) {
 
 function generationLabel(item) {
   const mode = generationMode(item)
-  if (mode === 'llm_context') return 'GPT + 文献上下文'
+  if (mode === 'llm_context') return 'GPT + 上下文兜底'
   if (mode !== 'llm_rag') return '规则兜底'
   const text = [item?.content, item?.content_md, item?.review_text, item?.rationale, item?.summary].filter(Boolean).join(' ')
   if (/DeepSeek\s*\+\s*(?:Milvus\s+)?RAG/i.test(text)) return 'DeepSeek + RAG'
@@ -677,7 +677,7 @@ function generationLabel(item) {
 }
 
 function generationType(item) {
-  return ['llm_rag', 'llm_context'].includes(generationMode(item)) ? 'success' : 'warning'
+  return generationMode(item) === 'llm_rag' ? 'success' : 'warning'
 }
 
 function keywordGenerationMode(item) {
@@ -704,7 +704,13 @@ function keywordGenerationType(item) {
 function generationDescription(item) {
   const mode = generationMode(item)
   if (mode === 'llm_rag') return '已基于 Milvus 向量召回证据包生成，正文中的 [R1] 等编号对应检索结果。'
-  if (mode === 'llm_context') return 'Milvus/embedding 暂未返回向量证据，但已基于真实检索文献上下文调用大模型生成。'
+  if (mode === 'llm_context') {
+    const text = [item?.content, item?.content_md, item?.review_text, item?.rationale, item?.summary].filter(Boolean).join(' ')
+    const reason = text.match(/真实文献上下文约束（([^）]+)）/)?.[1]
+    return reason
+      ? `当前没有用上 Milvus 向量召回：${reason}。已先基于真实检索文献上下文调用大模型生成。`
+      : '当前没有用上 Milvus 向量召回，已先基于真实检索文献上下文调用大模型生成；请检查系统状态里的 Milvus 连接。'
+  }
   return '当前为规则模板兜底，通常是未配置大模型、请求超时或返回内容未通过校验。'
 }
 </script>
