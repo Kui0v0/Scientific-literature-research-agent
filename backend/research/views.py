@@ -351,6 +351,12 @@ def health(request):
         "status": "ok",
         "name": "scientific-literature-agent",
         "llm": llm_config_status(),
+        "rag": {
+            "use_milvus": os.getenv("USE_MILVUS", "1") == "1",
+            "host": os.getenv("MILVUS_HOST", "127.0.0.1"),
+            "port": os.getenv("MILVUS_PORT", "19530"),
+            "collection": os.getenv("MILVUS_COLLECTION", "literature_rag_chunks"),
+        },
     }
     if settings.DEBUG:
         payload["runtime"] = {

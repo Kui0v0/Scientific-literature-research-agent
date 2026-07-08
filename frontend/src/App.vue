@@ -157,16 +157,13 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
-  ArrowDown,
   Bell,
   DataAnalysis,
   Document,
-  Download,
   EditPen,
   Files,
   MagicStick,
   Operation,
-  QuestionFilled,
   Reading,
   Search,
   Setting,
@@ -174,7 +171,6 @@ import {
 } from '@element-plus/icons-vue'
 import api from './api'
 import AppSidebar from './components/AppSidebar.vue'
-import AppTopbar from './components/AppTopbar.vue'
 import LoginPanel from './components/LoginPanel.vue'
 import MainContent from './components/MainContent.vue'
 import NotificationDrawer from './components/NotificationDrawer.vue'
@@ -182,15 +178,38 @@ import ProfileDialog from './components/ProfileDialog.vue'
 import TodoDrawer from './components/TodoDrawer.vue'
 import UserDialog from './components/UserDialog.vue'
 import ActivityDrawer from './components/ActivityDrawer.vue'
+import {
+  emptyGapStats,
+  formatNumber,
+  normalizeReportFormat,
+  normalizeUserStats,
+  progressValue,
+  radarAxis,
+  radarGrid,
+  radarLabelPosition,
+  radarPoints,
+  radarPolygon,
+  readJsonStorage,
+  writeJsonStorage,
+} from './utils/appUtils'
 
 const NOTIFICATION_READ_KEY = 'research-agent-notification-read-map'
 const SETTINGS_STORAGE_KEY = 'research-agent-settings'
+const EMPTY_PROFILE = Object.freeze({
+  name: '',
+  role: '分析师',
+  avatarText: '',
+  avatarUrl: '',
+  email: '',
+  username: '',
+  canManageSystem: false,
+  canManageUsers: false,
+})
 const systemViews = ['users', 'logs', 'settings']
 const adminOnlyViews = ['users', 'logs']
 
 const isAuthenticated = ref(false)
 const authMode = ref('login')
-const currentUser = ref(null)
 const loginForm = reactive({
   username: '',
   password: '',
@@ -226,11 +245,11 @@ const fullAgentStatus = ref('')
 const systemLogRows = ref([])
 const serverNotifications = ref([])
 const activityRows = ref([])
+const healthStatus = ref(null)
 const expandedNotificationIds = ref([])
 const notificationReadMap = ref(readJsonStorage(NOTIFICATION_READ_KEY, {}))
 const allTodoItems = ref([])
 const users = ref([])
-const sessionStartedAt = ref(formatDateTime(new Date()))
 const profileDialogVisible = ref(false)
 const userDialogVisible = ref(false)
 const notificationDrawerVisible = ref(false)
@@ -251,17 +270,8 @@ const dashboard = ref({
   recent_tasks: [],
   source_distribution: [],
 })
-const profile = reactive({
-  name: '张研究员',
-  role: '分析师',
-  avatarText: '张',
-  avatarUrl: '',
-  email: 'zhang@example.com',
-  username: '',
-  canManageSystem: false,
-  canManageUsers: false,
-})
-const profileForm = reactive({ ...profile })
+const profile = reactive({ ...EMPTY_PROFILE })
+const profileForm = reactive({ ...EMPTY_PROFILE })
 const editingUserUsername = ref('')
 const editingUserId = ref(null)
 const editingUserRoleLocked = ref(false)
@@ -375,13 +385,27 @@ const roles = [
   { name: '运营人员', desc: '查看系统设置，维护演示数据，协助生成汇报材料；系统日志仅管理员可查看。' },
   { name: '分析师', desc: '执行文献检索、热点分析、实验方案生成和报告导出，可查看系统设置；系统日志仅管理员可查看。' },
 ]
-const systemStatus = [
-  { label: '服务运行状态', value: '正常' },
-  { label: '数据库连接', value: '正常' },
-  { label: '文献数据库同步', value: '正常' },
-  { label: 'AI 模型服务', value: '正常' },
-]
-const systemLoad = computed(() => Math.min(86, 32 + dashboard.value.stats.tasks * 3))
+const systemStatus = computed(() => {
+  const health = healthStatus.value
+  if (!health) {
+    return [
+      { label: '服务运行状态', value: '待检测' },
+      { label: '数据库连接', value: '待检测' },
+      { label: 'Milvus 向量库', value: '待检测' },
+      { label: 'AI 模型服务', value: '待检测' },
+    ]
+  }
+  const llm = health.llm || {}
+  const rag = health.rag || {}
+  const milvusEnabled = rag.use_milvus ?? rag.enabled
+  return [
+    { label: '服务运行状态', value: health.ok === false ? '异常' : '正常' },
+    { label: '数据库连接', value: health.runtime?.db_engine ? '正常' : health.ok === false ? '未知' : '已配置' },
+    { label: 'Milvus 向量库', value: milvusEnabled ? `已启用：${rag.collection || '默认集合'}` : '未启用' },
+    { label: 'AI 模型服务', value: llm.enabled ? `${llm.provider || 'LLM'} 已启用` : '未启用' },
+  ]
+})
+const systemLoad = computed(() => (healthStatus.value?.ok === false ? 0 : Math.min(86, 20 + dashboard.value.stats.tasks * 2)))
 const reportDownloadFormat = computed(() => normalizeReportFormat(settings.reportFormat))
 const downloadUrl = computed(() =>
   report.value
@@ -428,12 +452,6 @@ function canAccessSystemView(view) {
 
 function normalizeRole(role) {
   return role && role !== '注册用户' ? role : '分析师'
-}
-
-function roleScope(role) {
-  return normalizeRole(role) === '管理员'
-    ? '核心功能、用户与权限管理、系统日志、系统设置'
-    : '核心功能、系统设置'
 }
 
 function toggleNotification(id) {
@@ -490,21 +508,6 @@ function handleAvatarFile(event) {
 function clearAvatarImage() {
   profileForm.avatarUrl = ''
   profileForm.avatarText = (profileForm.avatarText || profileForm.name.slice(0, 1) || '研').slice(0, 2)
-}
-
-function readJsonStorage(key, fallback) {
-  if (typeof localStorage === 'undefined') return fallback
-  try {
-    const raw = localStorage.getItem(key)
-    return raw ? JSON.parse(raw) : fallback
-  } catch {
-    return fallback
-  }
-}
-
-function writeJsonStorage(key, value) {
-  if (typeof localStorage === 'undefined') return
-  localStorage.setItem(key, JSON.stringify(value))
 }
 
 async function refreshDashboard() {
@@ -574,41 +577,6 @@ function ensureSources() {
   if (!selectedSources.value.length) throw new Error('至少选择一个真实数据源')
 }
 
-function emptyGapStats() {
-  return {
-    is_real: true,
-    query: '',
-    record_count: 0,
-    field_record_count: 0,
-    research_area: null,
-    metrics: [],
-    current_values: [],
-    average_values: [],
-  }
-}
-
-function normalizeUserStats(stats = {}) {
-  return {
-    literature: Number(stats.literature || 0),
-    summaries: Number(stats.summaries || 0),
-    experiments: Number(stats.experiments || 0),
-    reports: Number(stats.reports || 0),
-  }
-}
-
-function formatNumber(value) {
-  return Number(value).toLocaleString('en-US')
-}
-
-function formatDateTime(date) {
-  const pad = (value) => String(value).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
-}
-
-function progressValue(value, max) {
-  return Math.max(8, Math.round((value / max) * 100))
-}
-
 function linePoints(values) {
   const xStart = 54
   const xGap = values.length > 1 ? 670 / (values.length - 1) : 0
@@ -624,41 +592,6 @@ function linePoints(values) {
     .join(' ')
 }
 
-function radarAxis(index, radius = 96) {
-  const angle = -Math.PI / 2 + (index * Math.PI * 2) / 6
-  return {
-    x: 150 + Math.cos(angle) * radius,
-    y: 136 + Math.sin(angle) * radius,
-  }
-}
-
-function radarLabelPosition(index) {
-  return [
-    { x: 150, y: 22, anchor: 'middle' },
-    { x: 236, y: 86, anchor: 'start' },
-    { x: 226, y: 204, anchor: 'start' },
-    { x: 150, y: 263, anchor: 'middle' },
-    { x: 70, y: 204, anchor: 'end' },
-    { x: 64, y: 86, anchor: 'end' },
-  ][index] || { x: 150, y: 136, anchor: 'middle' }
-}
-
-function radarGrid(scale) {
-  return Array.from({ length: 6 }, (_, index) => radarAxis(index, 96 * scale))
-    .map((point) => `${point.x},${point.y}`)
-    .join(' ')
-}
-
-function radarPoints(values) {
-  return values.map((value, index) => radarAxis(index, value * 0.96))
-}
-
-function radarPolygon(values) {
-  return radarPoints(values)
-    .map((point) => `${point.x},${point.y}`)
-    .join(' ')
-}
-
 function decorateIconPayload(item = {}) {
   return {
     ...item,
@@ -668,6 +601,7 @@ function decorateIconPayload(item = {}) {
 
 async function loadAuthenticatedContext() {
   await Promise.all([
+    fetchHealthStatus(),
     refreshDashboard(),
     fetchTodos(),
     refreshActivityData(),
@@ -682,24 +616,31 @@ async function loadAuthenticatedContext() {
   }
 }
 
+async function fetchHealthStatus() {
+  try {
+    healthStatus.value = await api.get('/health/')
+  } catch (err) {
+    healthStatus.value = { ok: false, error: err.message || '健康检查失败' }
+  }
+}
+
 function applyAccount(account) {
+  const displayName = account.name || account.username || ''
   const nextProfile = {
-    name: account.name || account.username,
+    name: displayName,
     role: normalizeRole(account.role),
-    avatarText: account.avatarText || account.name?.slice(0, 1) || account.username?.slice(0, 1) || '研',
+    avatarText: account.avatarText || displayName.slice(0, 1) || '研',
     avatarUrl: account.avatarUrl || '',
     email: account.email || '',
-    username: account.username,
+    username: account.username || '',
     canManageSystem: Boolean(account.canManageSystem),
     canManageUsers: Boolean(account.canManageUsers),
   }
   Object.assign(profile, nextProfile)
   Object.assign(profileForm, nextProfile)
-  currentUser.value = account
   isAuthenticated.value = true
   currentView.value = 'home'
   error.value = ''
-  sessionStartedAt.value = formatDateTime(new Date())
   expandedNotificationIds.value = []
 }
 
@@ -768,23 +709,14 @@ async function restoreSession() {
 
 function clearAuthenticatedState() {
   isAuthenticated.value = false
-  currentUser.value = null
   users.value = []
   systemLogRows.value = []
   activityRows.value = []
   serverNotifications.value = []
   allTodoItems.value = []
+  healthStatus.value = null
   currentView.value = 'home'
-  Object.assign(profile, {
-    name: '研究员',
-    role: '分析师',
-    avatarText: '研',
-    avatarUrl: '',
-    email: '',
-    username: '',
-    canManageSystem: false,
-    canManageUsers: false,
-  })
+  Object.assign(profile, EMPTY_PROFILE)
   Object.assign(profileForm, profile)
 }
 
@@ -804,6 +736,7 @@ async function navigateTo(view) {
   error.value = ''
   if (view === 'users') await fetchUsers()
   if (view === 'logs') await refreshLogs({ silent: true })
+  if (view === 'settings' || view === 'home') await fetchHealthStatus()
 }
 
 function resetUserForm() {
@@ -1120,26 +1053,6 @@ async function deleteTodo(id) {
   }
 }
 
-function allAccounts() {
-  return users.value
-}
-
-function clearCurrentSession() {
-  clearAuthenticatedState()
-}
-
-function addLogRow() {}
-
-function activityFromLogRow() {
-  return null
-}
-
-function addUserNotification() {}
-
-function persistProfileOverride() {}
-
-function incrementUserStats() {}
-
 async function runSearch() {
   currentView.value = 'literature'
   await runStep('search', async () => {
@@ -1368,13 +1281,6 @@ function isLegacyKeywordAnalysis(item) {
   const hotspots = item?.hotspots || []
   if (!hotspots.length) return false
   return !hotspots.some((row) => ['llm_keywords', 'metadata_keywords'].includes(row?.generation))
-}
-
-function normalizeReportFormat(format) {
-  const value = String(format || '').toLowerCase()
-  if (value === 'pdf') return 'pdf'
-  if (value === 'word' || value === 'docx') return 'docx'
-  return 'markdown'
 }
 
 function saveSettings() {
