@@ -32,7 +32,7 @@ class Command(BaseCommand):
         users = {}
         for username, name, role, password_env in MEMBER_ACCOUNTS:
             user, created = User.objects.get_or_create(username=username)
-            password = os.getenv(password_env)
+            password = demo_password(password_env, role)
             if password:
                 user.set_password(password)
             elif created:
@@ -116,3 +116,8 @@ def assign_role(user, role):
             user.groups.add(group)
         else:
             user.groups.remove(group)
+
+
+def demo_password(password_env, role):
+    role_default = "DEMO_ADMIN_PASSWORD" if role == "管理员" else "DEMO_ANALYST_PASSWORD"
+    return os.getenv(password_env) or os.getenv(role_default)

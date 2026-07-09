@@ -19,7 +19,7 @@
 | 后端 | Django、PyMySQL、Pandas |
 | 前端 | Vue 3、Vite、Element Plus |
 | 向量数据库 | Milvus |
-| 生成模型 | GPT / OpenAI 兼容接口、DeepSeek 可选 |
+| 生成模型 | GPT / OpenAI 兼容接口 |
 | RAG | OpenAI/Ollama 兼容 embeddings、Milvus 向量召回、可选 BGE rerank |
 | 导出 | ReportLab、python-docx |
 | 部署 | Docker Compose 或本地开发环境 |
@@ -86,7 +86,6 @@ MYSQL_PASSWORD=<set-mysql-password>
 MYSQL_ROOT_PASSWORD=<set-root-password>
 
 USE_LLM=1
-LLM_PROVIDER=openai
 OPENAI_API_KEY=<your-api-key>
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o-mini
@@ -171,7 +170,6 @@ npm run dev
 | 变量 | 说明 |
 | --- | --- |
 | `USE_LLM` | `1` 启用大模型，`0` 使用规则兜底 |
-| `LLM_PROVIDER` | `openai` 或 `deepseek` |
 | `OPENAI_API_KEY` | OpenAI 或兼容接口 Key，仅放本地 `.env` |
 | `OPENAI_BASE_URL` | OpenAI 或兼容接口地址，仅放本地 `.env` |
 | `OPENAI_MODEL` | 生成模型名 |
@@ -179,14 +177,9 @@ npm run dev
 | `MILVUS_HOST` / `MILVUS_PORT` | Milvus 地址和端口 |
 | `RAG_EMBEDDING_BASE_URL` | OpenAI/Ollama 兼容 embedding 接口地址 |
 | `RAG_EMBEDDING_MODEL` | embedding 模型名，默认建议 `embeddinggemma` |
-| `RAG_RERANK_ENABLED` | `1` 启用本地 BGE rerank，`0` 关闭 |
-| `RAG_RERANK_ALLOW_TORCH` | `1` 允许加载本地 Torch/BGE rerank 模型，默认 `0` 避免额外资源占用 |
-| `SEARCH_REVIEW_TIMEOUT` | 检索接口等待大模型综述生成的秒数上限 |
-| `RAG_MILVUS_ISOLATE` / `RAG_MILVUS_TIMEOUT` | 独立子进程执行 Milvus 召回，以及子进程等待秒数上限 |
-| `MILVUS_RPC_TIMEOUT` / `MILVUS_TOKEN` | Milvus REST 请求超时和 token 认证配置 |
 | `NCBI_EMAIL` / `CROSSREF_MAILTO` | 建议填写，用于学术接口礼貌访问 |
 
-更多变量见 `.env.example` 和 `backend/.env.example`。
+高级超时、token 上限、rerank 等参数已经放在代码默认值里；普通启动不需要填写。
 
 ## RAG 工作流
 
@@ -233,7 +226,7 @@ DEMO_ANALYST_PASSWORD=<set-demo-analyst-password>
 - 提交前建议执行：
 
 ```bash
-rg "sk-|api_key|OPENAI_API_KEY|DEEPSEEK_API_KEY|MYSQL_PASSWORD|OPENAI_BASE_URL"
+rg "sk-|api_key|OPENAI_API_KEY|MYSQL_PASSWORD|OPENAI_BASE_URL"
 ```
 
 确认没有真实密钥或私有地址出现在准备提交的文件里。

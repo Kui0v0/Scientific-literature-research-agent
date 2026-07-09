@@ -21,7 +21,7 @@ def llm_status_message():
     if os.getenv("USE_LLM", "0") != "1":
         return "USE_LLM 未设置为 1，后端未启用大模型。"
     if not _api_key():
-        return "未读取到当前 LLM_PROVIDER 对应的 API Key，请检查 backend/.env 并重启后端。"
+        return "未读取到 OPENAI_API_KEY，请检查 .env 并重启后端。"
     return _LAST_LLM_STATUS or "大模型已配置，但本次调用未返回有效内容。"
 
 
@@ -47,7 +47,7 @@ def fallback_notice(reason=None):
     reason = reason or _fallback_reason_from_status()
     hint = "请稍后重试，或调低生成字数、增加 `LLM_REQUEST_TIMEOUT`。"
     if os.getenv("USE_LLM", "0") != "1" or not _api_key():
-        hint = "配置 `USE_LLM=1` 和当前大模型 API Key 后重新生成可启用大模型。"
+        hint = "配置 `USE_LLM=1` 和 `OPENAI_API_KEY` 后重新生成可启用大模型。"
     return f"> 生成方式：规则模板兜底；原因：{reason}。{hint}\n\n"
 
 
@@ -55,14 +55,12 @@ def is_llm_rag_text(text):
     value = str(text or "")
     if "生成方式：规则模板兜底" in value:
         return False
-    return bool(re.search(r"(DeepSeek|OpenAI|GPT|大模型)\s*\+\s*(?:Milvus\s+)?RAG", value)) or bool(re.search(r"\[R\d+\]", value))
+    return bool(re.search(r"(OpenAI|GPT|大模型)\s*\+\s*(?:Milvus\s+)?RAG", value)) or bool(re.search(r"\[R\d+\]", value))
 
 
 def normalize_generation_notice(text):
     value = str(text or "")
     stale_reasons = [
-        "生成方式：规则模板兜底；原因：DeepSeek 调用成功。。",
-        "生成方式：规则模板兜底；原因：DeepSeek 调用成功。",
         "生成方式：规则模板兜底；原因：OpenAI 调用成功。。",
         "生成方式：规则模板兜底；原因：OpenAI 调用成功。",
         "生成方式：规则模板兜底；原因：GPT 调用成功。。",
@@ -202,66 +200,26 @@ def chat_json(messages, temperature=0.1, max_tokens=None):
 
 
 def _api_key():
-    provider = _selected_provider()
-    if provider == "openai":
-        return os.getenv("OPENAI_API_KEY", "")
-    if provider == "deepseek":
-        return os.getenv("DEEPSEEK_API_KEY", "")
-    return ""
+    return os.getenv("OPENAI_API_KEY", "").strip()
 
 
 def _model_name():
-    provider = _selected_provider()
-    if provider == "deepseek":
-        return os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
-    if provider == "openai":
-        return os.getenv("OPENAI_MODEL", "gpt-5.5")
-    return ""
+    return os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
 
 def _base_url():
-    provider = _selected_provider()
-    if provider == "deepseek":
-        return os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-    if provider == "openai":
-        return os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    return ""
+    return (os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip() or "https://api.openai.com/v1").rstrip("/")
 
 
 def _base_url_status():
-    provider = _selected_provider()
     base_url = _base_url()
-    official_defaults = {
-        "deepseek": "https://api.deepseek.com",
-        "openai": "https://api.openai.com/v1",
-    }
     if not base_url:
         return ""
-    return "official" if base_url == official_defaults.get(provider) else "custom-configured"
+    return "official" if base_url == "https://api.openai.com/v1" else "custom-configured"
 
 
 def _provider_label():
-    provider = _selected_provider()
-    if provider == "deepseek":
-        return "DeepSeek"
-    if provider == "openai":
-        return os.getenv("LLM_PROVIDER_NAME", "GPT").strip() or "GPT"
-    return "大模型"
-
-
-def _selected_provider():
-    requested = os.getenv("LLM_PROVIDER", "").strip().lower().replace("-", "_")
-    if requested in {"openai", "gpt", "openai_compatible", "openai_compat"}:
-        return "openai"
-    if requested == "deepseek":
-        return "deepseek"
-    if os.getenv("OPENAI_API_KEY") and not os.getenv("DEEPSEEK_API_KEY"):
-        return "openai"
-    if os.getenv("DEEPSEEK_API_KEY"):
-        return "deepseek"
-    if os.getenv("OPENAI_API_KEY"):
-        return "openai"
-    return ""
+    return "GPT"
 
 
 def _chat_url():
